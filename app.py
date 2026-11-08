@@ -3,19 +3,20 @@
 """
 as22122 - Your Personal CBSE Class 10 Test Platform
 ====================================================
-Single-file Streamlit application (everything lives in this one file).
+Single-file Streamlit application. No database, no SQL, no external services.
 
-Run the website :  streamlit run app.py
-Run the self-tests (no Streamlit needed) :  python app.py --selftest
-Create a password hash for secrets :        python app.py --hash-password
-Print the Supabase SQL schema :             python app.py --print-schema
+Data (question bank, chapters, tests, results, mistakes) is saved as plain JSON files in a
+folder next to this file (as22122_data/). IMPORTANT: Streamlit Community Cloud does NOT
+guarantee that local files survive a restart or redeploy - use Settings & Backup to download
+a backup regularly (and see the README for the auto-restore trick).
 
-Storage : Supabase (PostgREST over HTTPS) when SUPABASE_URL + SUPABASE_KEY are
-configured, otherwise a clearly-labelled LOCAL development mode (SQLite file).
+Run:        streamlit run app.py
+Self-tests: python app.py --selftest   (optional)
 """
 from __future__ import annotations
 
 import base64
+import copy
 import csv
 import hashlib
 import hmac
@@ -26,21 +27,16 @@ import math
 import os
 import random
 import re
-import secrets
-import sqlite3
+import shutil
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
-
-try:
-    import requests
-except ImportError:  # only needed for Supabase mode
-    requests = None
 
 try:
     import streamlit as st
@@ -106,7 +102,6 @@ STARTER_CHAPTERS = {
 }
 MIN_Q_FOR_RANK = 3          # minimum evaluated questions before a chapter is ranked weak/strong
 SESSION_TTL = 6 * 3600      # login session token lifetime (seconds)
-PBKDF2_ITER = 310_000
 MAX_IMAGE_BYTES = 1_500_000
 
 PRESETS = [
@@ -217,7 +212,7 @@ def pct(a: float, b: float) -> float:
 
 
 # =============================================================================
-# SECTION 3 - SECRETS, SIMPLE .env LOADER, PASSWORD HASHING, SESSION TOKENS
+# SECTION 3 - OPTIONAL SECRETS, SIMPLE .env LOADER, SESSION TOKENS
 # =============================================================================
 def _load_dotenv(path: str = ".env") -> None:
     """Tiny .env reader (KEY=VALUE lines). Existing environment variables win."""
@@ -246,28 +241,8 @@ def get_secret(name: str, default: Any = None) -> Any:
     return os.environ.get(name, default)
 
 
-def hash_password(password: str, iterations: int = PBKDF2_ITER, salt: Optional[bytes] = None) -> str:
-    salt = salt or secrets.token_bytes(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-    return f"pbkdf2_sha256${iterations}${salt.hex()}${dk.hex()}"
-
-
-def verify_password(password: str, stored: str) -> bool:
-    try:
-        algo, it, salt_hex, hash_hex = str(stored).strip().split("$")
-        if algo != "pbkdf2_sha256":
-            return False
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(it))
-        return hmac.compare_digest(dk.hex(), hash_hex)
-    except Exception:
-        return False
-
-
 def _session_key() -> bytes:
-    s = get_secret("SESSION_SECRET")
-    if s:
-        return str(s).encode()
-    return hashlib.sha256(("as22122|" + str(get_secret("OWNER_PASSWORD_HASH", ""))).encode()).digest()
+    return hashlib.sha256(("as22122-session|" + str(get_secret("APP_PASSWORD", ""))).encode()).digest()
 
 
 def make_session_token(owner: str, ttl: int = SESSION_TTL, now: Optional[float] = None) -> str:
@@ -289,9 +264,9 @@ def check_session_token(token: str, owner: str, now: Optional[float] = None) -> 
 
 
 # =============================================================================
-# SECTION 4 - DATABASE SCHEMA (single source of truth for SQLite AND Supabase)
+# SECTION 4 - DATA MODEL (tables and columns stored in the JSON files)
 # =============================================================================
-# Column types: text | int | real | bool | json (json is stored as TEXT in both back-ends)
+# Column types: text | int | real | bool | json (json = nested list/dict stored natively)
 SCHEMA: Dict[str, Dict[str, Any]] = {
     "chapters": {
         "cols": [("id", "text"), ("owner_id", "text"), ("subject", "text"), ("name", "text"),
@@ -347,73 +322,26 @@ SCHEMA: Dict[str, Dict[str, Any]] = {
         "indexes": [["owner_id"]],
     },
 }
-PG_TYPES = {"text": "text", "int": "bigint", "real": "double precision", "bool": "boolean", "json": "text"}
-SQLITE_TYPES = {"text": "TEXT", "int": "INTEGER", "real": "REAL", "bool": "INTEGER", "json": "TEXT"}
-
-
-def schema_sql() -> str:
-    out = [
-        "-- as22122 database schema for Supabase (PostgreSQL).",
-        "-- Generated from app.py with:  python app.py --print-schema",
-        "-- Run this whole file once in: Supabase Dashboard -> SQL Editor -> New query -> Run.",
-        "",
-    ]
-    for t, spec in SCHEMA.items():
-        cols = []
-        for name, typ in spec["cols"]:
-            line = f"  {name} {PG_TYPES[typ]}"
-            if name == "id":
-                line += " primary key"
-            elif name == "owner_id":
-                line += " not null"
-            ref = spec.get("fk", {}).get(name)
-            if ref:
-                line += f" references public.{ref}(id) on delete cascade"
-            cols.append(line)
-        for u in spec.get("unique", []):
-            cols.append(f"  unique ({', '.join(u)})")
-        out.append(f"create table if not exists public.{t} (\n" + ",\n".join(cols) + "\n);")
-        for idx in spec.get("indexes", []):
-            out.append(f"create index if not exists idx_{t}_{'_'.join(idx)} on public.{t} ({', '.join(idx)});")
-        out.append("")
-    out += [
-        "-- ---------------------------------------------------------------------------",
-        "-- SECURITY: Row Level Security is ENABLED on every table and NO policy is created",
-        "-- for the 'anon' or 'authenticated' roles, and their privileges are revoked.",
-        "-- The Streamlit app talks to the database with the SERVICE ROLE key, which is kept",
-        "-- server-side in Streamlit secrets and bypasses RLS. Result: anybody holding only the",
-        "-- public/anon key (or the project URL) cannot read or write any of your data.",
-        "-- Owner-only access to the *website* is enforced by the app login (PBKDF2 password).",
-        "-- NEVER put the service_role key in the browser, in GitHub, or in a public file.",
-        "-- ---------------------------------------------------------------------------",
-    ]
-    for t in SCHEMA:
-        out.append(f"alter table public.{t} enable row level security;")
-        out.append(f"revoke all on table public.{t} from anon, authenticated;")
-    out += [
-        "",
-        "-- FUTURE multi-user support (optional): every row already has owner_id. If you later",
-        "-- move to Supabase Auth, replace the service-role key with per-user JWTs and add, for",
-        "-- every table, a policy such as:",
-        "--   create policy owner_only on public.questions for all to authenticated",
-        "--     using (owner_id = auth.uid()::text) with check (owner_id = auth.uid()::text);",
-        "--   grant select, insert, update, delete on public.questions to authenticated;",
-    ]
-    return "\n".join(out) + "\n"
 
 
 # =============================================================================
-# SECTION 5 - STORAGE BACK-ENDS (SQLite local mode, Supabase REST)
+# SECTION 5 - LOCAL JSON STORAGE
 # =============================================================================
 class StoreError(Exception):
-    """Any database / network problem. The UI shows these instead of crashing."""
+    """Any storage problem. The UI shows these instead of crashing."""
+
+
+def _order_list(order: Any, default: str = "id") -> List[Tuple[str, bool]]:
+    items = [order] if isinstance(order, str) else list(order or [default])
+    return [(o.lstrip("-"), o.startswith("-")) for o in items]
 
 
 def _types(table: str) -> Dict[str, str]:
     return dict(SCHEMA[table]["cols"])
 
 
-def _encode(table: str, row: Dict[str, Any], backend: str) -> Dict[str, Any]:
+def _coerce(table: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert provided values to the column types (unknown keys are ignored)."""
     types = _types(table)
     out: Dict[str, Any] = {}
     for k, v in row.items():
@@ -422,283 +350,271 @@ def _encode(table: str, row: Dict[str, Any], backend: str) -> Dict[str, Any]:
             continue
         if isinstance(v, float) and math.isnan(v):
             v = None
-        if t == "json":
-            out[k] = None if v is None else json.dumps(v, ensure_ascii=False)
+        if v is None:
+            out[k] = None
+        elif t == "json":
+            out[k] = json.loads(json.dumps(v, ensure_ascii=False, default=str))   # deep copy, JSON-safe
         elif t == "bool":
-            out[k] = None if v is None else (bool(v) if backend == "supabase" else int(bool(v)))
+            out[k] = bool(v)
         elif t == "int":
-            out[k] = None if v in (None, "") else int(v)
+            out[k] = None if v == "" else int(v)
         elif t == "real":
-            out[k] = None if v in (None, "") else float(v)
+            out[k] = None if v == "" else float(v)
         else:
-            out[k] = None if v is None else str(v)
+            out[k] = str(v)
     return out
 
 
-def _decode(table: str, row: Dict[str, Any]) -> Dict[str, Any]:
-    types = _types(table)
-    out: Dict[str, Any] = {}
-    for k, v in row.items():
-        t = types.get(k)
-        if t == "json":
-            if isinstance(v, str):
-                try:
-                    out[k] = json.loads(v) if v != "" else None
-                except ValueError:
-                    out[k] = None
-            else:
-                out[k] = v
-        elif t == "bool":
-            out[k] = bool(v) if v is not None else False
-        elif t == "int":
-            out[k] = int(v) if v is not None else None
-        elif t == "real":
-            out[k] = float(v) if v is not None else None
-        else:
-            out[k] = v
-    return out
+class JsonStore:
+    """One JSON file per table inside a folder. Everything is kept in memory and each change
+    rewrites only that table's file (atomically, with a rolling .bak copy)."""
+    backend = "json"
 
-
-def _iter_where_chunks(where: Optional[Dict[str, Any]], size: int):
-    where = where or {}
-    in_keys = [k for k, v in where.items() if isinstance(v, tuple) and v and v[0] == "in"]
-    if not in_keys:
-        yield where
-        return
-    k = in_keys[0]
-    vals = list(where[k][1])
-    for i in range(0, len(vals), size):
-        w = dict(where)
-        w[k] = ("in", vals[i:i + size])
-        yield w
-
-
-def _order_list(order: Any, default: str = "id") -> List[Tuple[str, bool]]:
-    items = [order] if isinstance(order, str) else list(order or [default])
-    res = []
-    for o in items:
-        desc = o.startswith("-")
-        res.append((o.lstrip("-"), desc))
-    return res
-
-
-def _q(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
-
-
-class SqliteStore:
-    """Local development storage. NOT guaranteed to persist on Streamlit Community Cloud."""
-    backend = "sqlite"
-
-    def __init__(self, path: str = "as22122_local.db"):
-        self.path = path
-        for t, spec in SCHEMA.items():
-            cols = []
-            for name, typ in spec["cols"]:
-                d = f"{_q(name)} {SQLITE_TYPES[typ]}"
-                if name == "id":
-                    d += " PRIMARY KEY"
-                elif name == "owner_id":
-                    d += " NOT NULL"
-                cols.append(d)
-            for u in spec.get("unique", []):
-                cols.append("UNIQUE (" + ", ".join(_q(x) for x in u) + ")")
-            self._run(f"CREATE TABLE IF NOT EXISTS {_q(t)} (" + ", ".join(cols) + ")")
-            for idx in spec.get("indexes", []):
-                nm = f"idx_{t}_{'_'.join(idx)}"
-                self._run(f"CREATE INDEX IF NOT EXISTS {_q(nm)} ON {_q(t)} (" + ", ".join(_q(c) for c in idx) + ")")
-
-    def _run(self, sql: str, params: Iterable[Any] = (), fetch: bool = False, many: Optional[List[Tuple]] = None):
-        conn = sqlite3.connect(self.path, timeout=30)
+    def __init__(self, folder: str):
+        self.folder = folder
+        self.lock = threading.RLock()
+        self.data: Dict[str, Dict[str, Dict[str, Any]]] = {t: {} for t in SCHEMA}
+        self.notes: List[str] = []
+        self._bak_ts: Dict[str, float] = {}
         try:
-            conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            if many is not None:
-                cur.executemany(sql, many)
-            else:
-                cur.execute(sql, tuple(params))
-            rows = [dict(r) for r in cur.fetchall()] if fetch else None
-            conn.commit()
-            return rows
-        except sqlite3.Error as e:
-            raise StoreError(f"SQLite error: {e}") from e
-        finally:
-            conn.close()
+            os.makedirs(folder, exist_ok=True)
+            probe = os.path.join(folder, ".write_test")
+            with open(probe, "w") as fh:
+                fh.write("ok")
+            os.remove(probe)
+        except OSError as e:
+            raise StoreError(f"Cannot write to the data folder '{folder}': {e}") from e
+        for t in SCHEMA:
+            self._load(t)
 
-    def _where(self, table: str, where: Dict[str, Any]) -> Tuple[str, List[Any]]:
-        types = _types(table)
-        conds, params = [], []
-        for k, v in where.items():
-            if isinstance(v, tuple) and v and v[0] == "in":
-                vals = list(v[1])
-                conds.append(f"{_q(k)} IN ({','.join('?' * len(vals))})")
-                params += vals
-            else:
-                if types.get(k) == "bool":
-                    v = int(bool(v))
-                conds.append(f"{_q(k)} = ?")
-                params.append(v)
-        return (" WHERE " + " AND ".join(conds)) if conds else "", params
+    def _path(self, table: str) -> str:
+        return os.path.join(self.folder, f"{table}.json")
 
-    def select(self, table, where=None, cols=None, order=None, limit=None) -> List[Dict[str, Any]]:
-        sel = cols or [c for c, _ in SCHEMA[table]["cols"]]
-        out: List[Dict[str, Any]] = []
-        for w in _iter_where_chunks(where, 500):
-            wsql, params = self._where(table, w)
-            sql = f"SELECT {', '.join(_q(c) for c in sel)} FROM {_q(table)}{wsql}"
-            sql += " ORDER BY " + ", ".join(f"{_q(c)} {'DESC' if d else 'ASC'}" for c, d in _order_list(order))
-            if limit:
-                sql += f" LIMIT {int(limit)}"
-            out += [_decode(table, r) for r in self._run(sql, params, fetch=True)]
-        return out
+    def _load(self, table: str) -> None:
+        p = self._path(table)
+        had_main = os.path.exists(p)
+        for cand in (p, p + ".bak"):
+            if not os.path.exists(cand):
+                continue
+            try:
+                with open(cand, "r", encoding="utf-8") as fh:
+                    rows = json.load(fh)
+                self.data[table] = {r["id"]: r for r in rows}
+                if cand != p:
+                    self.notes.append(f"{table}.json was unreadable; recovered from its backup copy.")
+                return
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        if had_main:
+            try:
+                os.replace(p, p + ".corrupt")
+                self.notes.append(f"{table}.json was damaged and moved to {table}.json.corrupt; starting that table empty.")
+            except OSError:
+                pass
 
-    def upsert(self, table, rows) -> None:
-        if not rows:
-            return
-        enc = [_encode(table, r, "sqlite") for r in rows]
-        keys = list(dict.fromkeys(k for r in enc for k in r))
-        for r in enc:
-            for k in keys:
-                r.setdefault(k, None)
-        non_pk = [k for k in keys if k != "id"]
-        sql = f"INSERT INTO {_q(table)} ({', '.join(_q(k) for k in keys)}) VALUES ({','.join('?' * len(keys))})"
-        if non_pk:
-            sql += " ON CONFLICT(id) DO UPDATE SET " + ", ".join(f"{_q(k)}=excluded.{_q(k)}" for k in non_pk)
-        else:
-            sql += " ON CONFLICT(id) DO NOTHING"
-        self._run(sql, many=[tuple(r[k] for k in keys) for r in enc])
-
-    def update(self, table, values, where) -> None:
-        enc = _encode(table, values, "sqlite")
-        if not enc:
-            return
-        for w in _iter_where_chunks(where, 500):
-            wsql, wparams = self._where(table, w)
-            self._run(f"UPDATE {_q(table)} SET " + ", ".join(f"{_q(k)}=?" for k in enc) + wsql,
-                      list(enc.values()) + wparams)
-
-    def delete(self, table, where) -> None:
-        if not where:
-            raise StoreError("Refusing to delete without a filter")
-        for w in _iter_where_chunks(where, 500):
-            wsql, params = self._where(table, w)
-            self._run(f"DELETE FROM {_q(table)}{wsql}", params)
-
-    def check(self) -> Tuple[bool, str]:
+    def _flush(self, table: str) -> None:
+        p = self._path(table)
+        tmp = p + ".tmp"
         try:
-            self.select("settings", limit=1)
-            return True, f"Local SQLite file: {os.path.abspath(self.path)}"
-        except StoreError as e:
-            return False, str(e)
-
-
-class SupabaseStore:
-    """Supabase PostgREST client (uses `requests`; no extra database package needed)."""
-    backend = "supabase"
-
-    def __init__(self, url: str, key: str):
-        if requests is None:
-            raise StoreError("The 'requests' package is required for Supabase mode.")
-        self.base = url.rstrip("/") + "/rest/v1"
-        self.headers = {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        self.session = requests.Session()
-
-    def _req(self, method: str, table: str, params=None, body=None, prefer: Optional[str] = None):
-        headers = dict(self.headers)
-        if prefer:
-            headers["Prefer"] = prefer
-        try:
-            r = self.session.request(method, f"{self.base}/{table}", params=params,
-                                     data=None if body is None else json.dumps(body), headers=headers, timeout=40)
-        except Exception as e:
-            raise StoreError(f"Network error talking to Supabase: {e}") from e
-        if r.status_code >= 300:
-            hint = ""
-            if r.status_code in (401, 403):
-                hint = " (check SUPABASE_KEY: use the service_role key)"
-            elif r.status_code == 404:
-                hint = " (did you run schema.sql in the Supabase SQL editor?)"
-            raise StoreError(f"Supabase error {r.status_code}{hint}: {r.text[:300]}")
-        return r
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(list(self.data[table].values()), fh, ensure_ascii=False)
+            if os.path.exists(p) and time.time() - self._bak_ts.get(table, 0) > 60:
+                shutil.copyfile(p, p + ".bak")
+                self._bak_ts[table] = time.time()
+            os.replace(tmp, p)
+        except OSError as e:
+            raise StoreError(f"Could not save {table}.json: {e}") from e
 
     @staticmethod
-    def _filters(where: Dict[str, Any]) -> Dict[str, str]:
-        out = {}
+    def _match(row: Dict[str, Any], where: Dict[str, Any]) -> bool:
         for k, v in where.items():
             if isinstance(v, tuple) and v and v[0] == "in":
-                items = ",".join('"' + str(x).replace("\\", "\\\\").replace('"', '\\"') + '"' for x in v[1])
-                out[k] = f"in.({items})"
-            elif isinstance(v, bool):
-                out[k] = f"eq.{'true' if v else 'false'}"
+                if row.get(k) not in v[1]:
+                    return False
+            elif row.get(k) != v:
+                return False
+        return True
+
+    def _clone(self, table: str, row: Dict[str, Any], cols: List[str]) -> Dict[str, Any]:
+        types = _types(table)
+        out = {}
+        for c in cols:
+            v = row.get(c)
+            t = types.get(c)
+            if t == "json":
+                out[c] = copy.deepcopy(v)
+            elif t == "bool":
+                out[c] = bool(v) if v is not None else False
             else:
-                out[k] = f"eq.{v}"
+                out[c] = v
         return out
 
     def select(self, table, where=None, cols=None, order=None, limit=None) -> List[Dict[str, Any]]:
         sel = cols or [c for c, _ in SCHEMA[table]["cols"]]
-        ordering = ",".join(f"{c}.{'desc' if d else 'asc'}" for c, d in _order_list(order))
-        out: List[Dict[str, Any]] = []
-        for w in _iter_where_chunks(where, 100):
-            offset, page = 0, 1000
-            while True:
-                params = self._filters(w)
-                params.update({"select": ",".join(sel), "order": ordering, "limit": str(page), "offset": str(offset)})
-                batch = self._req("GET", table, params).json()
-                out += [_decode(table, r) for r in batch]
-                if len(batch) < page or (limit and len(out) >= limit):
-                    break
-                offset += page
-        return out[:limit] if limit else out
+        w = {k: (("in", set(v[1])) if isinstance(v, tuple) and v and v[0] == "in" else v) for k, v in (where or {}).items()}
+        with self.lock:
+            rows = [r for r in self.data[table].values() if self._match(r, w)]
+            for c, desc in reversed(_order_list(order)):
+                rows.sort(key=lambda r, c=c: (r.get(c) is None, r.get(c) if r.get(c) is not None else 0), reverse=desc)
+            if limit:
+                rows = rows[:int(limit)]
+            return [self._clone(table, r, sel) for r in rows]
+
+    def _check_unique(self, table: str, merged: Dict[str, Dict[str, Any]]) -> None:
+        for u in SCHEMA[table].get("unique", []):
+            seen = {}
+            for rid, r in merged.items():
+                key = tuple(r.get(c) for c in u)
+                if key in seen and seen[key] != rid:
+                    raise StoreError(f"Duplicate entry for {', '.join(u)} in {table}")
+                seen[key] = rid
 
     def upsert(self, table, rows) -> None:
         if not rows:
             return
-        enc = [_encode(table, r, "supabase") for r in rows]
-        for i in range(0, len(enc), 200):
-            chunk = enc[i:i + 200]
-            keys = list(dict.fromkeys(k for r in chunk for k in r))
-            chunk = [{k: r.get(k) for k in keys} for r in chunk]
-            self._req("POST", table, {"on_conflict": "id"}, chunk, "resolution=merge-duplicates,return=minimal")
+        blank = {c: None for c, _ in SCHEMA[table]["cols"]}
+        with self.lock:
+            merged = dict(self.data[table])
+            for r in rows:
+                c = _coerce(table, r)
+                rid = c.get("id")
+                if not rid:
+                    raise StoreError("Row without id")
+                cur = dict(merged.get(rid) or blank)
+                cur.update(c)
+                merged[rid] = cur
+            self._check_unique(table, merged)
+            self.data[table] = merged
+            self._flush(table)
 
     def update(self, table, values, where) -> None:
-        enc = _encode(table, values, "supabase")
-        if not enc:
+        vals = _coerce(table, values)
+        if not vals:
             return
-        for w in _iter_where_chunks(where, 100):
-            self._req("PATCH", table, self._filters(w), enc, "return=minimal")
+        w = {k: (("in", set(v[1])) if isinstance(v, tuple) and v and v[0] == "in" else v) for k, v in where.items()}
+        with self.lock:
+            hit = False
+            for r in self.data[table].values():
+                if self._match(r, w):
+                    r.update(copy.deepcopy(vals))
+                    hit = True
+            if hit:
+                self._flush(table)
 
     def delete(self, table, where) -> None:
         if not where:
             raise StoreError("Refusing to delete without a filter")
-        for w in _iter_where_chunks(where, 100):
-            self._req("DELETE", table, self._filters(w), None, "return=minimal")
+        w = {k: (("in", set(v[1])) if isinstance(v, tuple) and v and v[0] == "in" else v) for k, v in where.items()}
+        with self.lock:
+            gone = [rid for rid, r in self.data[table].items() if self._match(r, w)]
+            for rid in gone:
+                del self.data[table][rid]
+            if gone:
+                self._flush(table)
+
+    def replace_table(self, table: str, rows: List[Dict[str, Any]]) -> None:
+        blank = {c: None for c, _ in SCHEMA[table]["cols"]}
+        with self.lock:
+            new = {}
+            for r in rows:
+                c = _coerce(table, r)
+                if c.get("id"):
+                    d = dict(blank)
+                    d.update(c)
+                    new[c["id"]] = d
+            self._check_unique(table, new)
+            self.data[table] = new
+            self._flush(table)
+
+    def is_empty(self) -> bool:
+        return not any(self.data[t] for t in ("questions", "chapters", "attempts"))
 
     def check(self) -> Tuple[bool, str]:
+        msg = f"Local JSON files in: {os.path.abspath(self.folder)}"
+        if self.notes:
+            msg += " | " + " ".join(self.notes)
+        return True, msg
+
+
+# ---- backup / restore (plain JSON; also used for the optional auto-restore) -------------------
+BACKUP_FILENAME = "as22122_backup.json"
+
+
+def build_backup(store: "JsonStore", owner: str) -> str:
+    tables = {t: store.select(t, {"owner_id": owner}) for t in SCHEMA}
+    return json.dumps({"app": APP_NAME, "version": 2, "created": iso_now(), "tables": tables}, ensure_ascii=False)
+
+
+def restore_into_store(store: "JsonStore", payload: Any, owner: str) -> Dict[str, int]:
+    """Replace ALL data of `owner` with the backup contents. Raises ValueError for bad files."""
+    if isinstance(payload, (str, bytes)):
         try:
-            self.select("settings", limit=1)
-            return True, "Connected to Supabase"
-        except StoreError as e:
-            return False, str(e)
+            payload = json.loads(payload)
+        except ValueError as e:
+            raise ValueError(f"Not a valid JSON file: {e}")
+    if not isinstance(payload, dict):
+        raise ValueError("Backup must be a JSON object.")
+    tables = payload.get("tables", payload)
+    if not isinstance(tables, dict) or not any(t in tables for t in SCHEMA):
+        raise ValueError("This does not look like an as22122 backup (no known tables found).")
+    counts: Dict[str, int] = {}
+    staged: Dict[str, List[Dict[str, Any]]] = {}
+    for t in SCHEMA:
+        rows = tables.get(t, [])
+        if not isinstance(rows, list):
+            raise ValueError(f"Table '{t}' in the backup is not a list.")
+        fixed = []
+        for r in rows:
+            if not isinstance(r, dict):
+                raise ValueError(f"A row in '{t}' is not an object.")
+            r = dict(r)
+            r["owner_id"] = owner
+            for c, typ in SCHEMA[t]["cols"]:      # older backups may hold JSON columns as strings
+                if typ == "json" and isinstance(r.get(c), str):
+                    try:
+                        r[c] = json.loads(r[c])
+                    except ValueError:
+                        r[c] = None
+            fixed.append(r)
+        counts[t] = len(fixed)
+        staged[t] = fixed
+    for t in SCHEMA:
+        store.replace_table(t, staged[t])
+    return counts
 
 
-def make_store():
-    url, key = get_secret("SUPABASE_URL"), get_secret("SUPABASE_KEY")
-    if url and key:
-        return SupabaseStore(str(url), str(key))
-    return SqliteStore(str(get_secret("LOCAL_DB_PATH", "as22122_local.db")))
+def _app_dir() -> str:
+    try:
+        return os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        return os.getcwd()
+
+
+def make_store() -> "JsonStore":
+    """Data folder: DATA_DIR (optional secret/env) or ./as22122_data next to app.py.
+    If that location is read-only, fall back to the system temp folder."""
+    owner = str(get_secret("OWNER_ID", "owner"))
+    wanted = str(get_secret("DATA_DIR", "") or os.path.join(_app_dir(), "as22122_data"))
+    try:
+        store = JsonStore(wanted)
+    except StoreError:
+        store = JsonStore(os.path.join(tempfile.gettempdir(), "as22122_data"))
+        store.notes.append("The app folder was read-only, so the system temp folder is being used.")
+    # Auto-restore: a fresh/empty server + a backup file committed next to app.py -> load it.
+    seed = os.path.join(_app_dir(), BACKUP_FILENAME)
+    if store.is_empty() and os.path.exists(seed):
+        try:
+            with open(seed, "r", encoding="utf-8") as fh:
+                restore_into_store(store, json.load(fh), owner)
+            store.notes.append(f"Data was automatically restored from {BACKUP_FILENAME}.")
+        except (OSError, ValueError, StoreError) as e:
+            store.notes.append(f"Could not auto-restore {BACKUP_FILENAME}: {e}")
+    return store
 
 
 # ---- module-level handles used by every data function --------------------------------------
-DB = None            # set by init_db()
-OWNER = "owner"      # single-user today; every row carries owner_id for future multi-user use
-
-
-def init_db():
-    global DB, OWNER
-    OWNER = str(get_secret("OWNER_ID", "owner"))
-    if DB is None:
-        DB = make_store()
-    return DB
+DB = None            # set in main() / tests
+OWNER = "owner"      # single user today; rows carry owner_id so multi-user could be added later
 
 
 def invalidate_cache() -> None:
@@ -716,8 +632,7 @@ def q_select(table, where=None, cols=None, order=None, limit=None):
 
 
 def q_upsert(table, rows, touch=True):
-    rows = [dict(r, owner_id=OWNER) for r in rows]
-    DB.upsert(table, rows)
+    DB.upsert(table, [dict(r, owner_id=OWNER) for r in rows])
     if touch:
         invalidate_cache()
 
@@ -1652,7 +1567,7 @@ def build_report_html(att: Dict[str, Any], answers: List[Dict[str, Any]]) -> str
 # SECTION 14 - BUILT-IN SELF-TESTS  (run with:  python app.py --selftest)
 # =============================================================================
 def run_selftests() -> List[Tuple[str, bool, str]]:
-    """Runs against a throw-away SQLite file; never touches your real data."""
+    """Runs against a throw-away temporary folder; never touches your real data."""
     global DB, OWNER
     results: List[Tuple[str, bool, str]] = []
 
@@ -1737,19 +1652,19 @@ def run_selftests() -> List[Tuple[str, bool, str]]:
           len(paper) == 8 and len({p["id"] for p in paper}) == 8 and len(warns) == 1 and all(p["max_marks"] == 2 for p in paper if p["section"] == "B"), str(warns))
 
     # ---- auth --------------------------------------------------------------------------------
-    h = hash_password("correct horse", iterations=1000)
-    check("Password hash verifies", verify_password("correct horse", h) and not verify_password("wrong", h) and "correct horse" not in h)
-    tok = make_session_token("owner", 60)
-    check("Session token valid, tamper/expiry rejected", check_session_token(tok, "owner") and not check_session_token(tok + "x", "owner")
-          and not check_session_token(tok, "other") and not check_session_token(make_session_token("owner", 60, now=time.time() - 3600), "owner"))
-    sql = schema_sql()
-    check("Schema SQL covers all tables + RLS", all(f"public.{t}" in sql for t in SCHEMA) and "enable row level security" in sql)
+    os.environ["APP_PASSWORD"] = "selftest-password"
+    try:
+        tok = make_session_token("owner", 60)
+        check("Session token valid, tamper/expiry rejected", check_session_token(tok, "owner") and not check_session_token(tok + "x", "owner")
+              and not check_session_token(tok, "other") and not check_session_token(make_session_token("owner", 60, now=time.time() - 3600), "owner"))
+    finally:
+        os.environ.pop("APP_PASSWORD", None)
 
-    # ---- database round trip (temp SQLite) ---------------------------------------------------
+    # ---- data round trip (temporary JSON folder) ---------------------------------------------------
     old = (DB, OWNER)
     tmpdir = tempfile.mkdtemp()
     try:
-        DB, OWNER = SqliteStore(os.path.join(tmpdir, "t.db")), "selftest"
+        DB, OWNER = JsonStore(os.path.join(tmpdir, "data")), "selftest"
         check("Seed starter chapters", seed_starter_chapters() > 0 and seed_starter_chapters() == 0)
         try:
             add_chapter("Science", "Physics")
@@ -1813,6 +1728,25 @@ def run_selftests() -> List[Tuple[str, bool, str]]:
         save_question(validate_question(dict(good, question_id="T9", question_text="Nine"), {"Mathematics Standard": {"real numbers (edited)": "Real Numbers (edited)"}}, True)[0], True)
         delete_questions(["T9"])
         check("Question add + delete", get_question("T9") is None)
+        # ---- JSON store specifics: persistence, recovery, backup/restore -----------------------
+        reopened = JsonStore(os.path.join(tmpdir, "data"))
+        check("Data persists on disk (re-opening the store finds it)", len(reopened.select("questions", {"owner_id": "selftest"})) == 4 and len(reopened.select("attempts", {"owner_id": "selftest"})) == 2)
+        qf = os.path.join(tmpdir, "data", "questions.json")
+        shutil.copyfile(qf, qf + ".bak")
+        with open(qf, "w") as fh:
+            fh.write("{ broken json")
+        rec = JsonStore(os.path.join(tmpdir, "data"))
+        check("Damaged file is recovered from its .bak copy", len(rec.select("questions", {"owner_id": "selftest"})) == 4 and bool(rec.notes), str(rec.notes))
+        blob = build_backup(DB, "selftest")
+        other = JsonStore(os.path.join(tmpdir, "data2"))
+        counts = restore_into_store(other, blob, "selftest")
+        check("Backup -> restore round trip keeps every row", counts["questions"] == 4 and len(other.select("questions", {"owner_id": "selftest"})) == 4
+              and len(other.select("attempt_answers", {"owner_id": "selftest"})) == len(DB.select("attempt_answers", {"owner_id": "selftest"})))
+        try:
+            restore_into_store(other, "[1,2]", "selftest")
+            check("Bad backup file rejected", False)
+        except ValueError:
+            check("Bad backup file rejected", True)
     except Exception as e:  # report instead of crashing
         check("Database round trip", False, repr(e))
     finally:
@@ -2015,26 +1949,12 @@ def render_question(q: Dict[str, Any], show_answer: bool = True, number: Optiona
 
 
 # =============================================================================
-# SECTION 16 - AUTHENTICATION UI (owner-only)
+# SECTION 16 - OPTIONAL PASSWORD (no setup needed)
 # =============================================================================
-def setup_screen() -> None:
-    st.markdown(f"<div class='hero'><h1>{APP_NAME}</h1><p>{TAGLINE}</p></div>", unsafe_allow_html=True)
-    st.error("Owner login is not configured yet, so the app is locked. Nothing is shown until you set a password.")
-    st.markdown(
-        "**1.** Create a password hash. Safest: run `python app.py --hash-password` on your own computer. "
-        "Or type a password below to generate a hash here (it is only displayed, never stored).\n\n"
-        "**2.** Put it in **Streamlit secrets** (or your `.env` for local use):\n"
-        "```toml\nOWNER_USERNAME = \"owner\"\nOWNER_PASSWORD_HASH = \"pbkdf2_sha256$...\"\n```\n"
-        "**3.** Reboot the app. See README.md for the full guide.")
-    pw = st.text_input("New password (min 10 characters)", type="password", key="setup_pw")
-    if st.button("Generate hash"):
-        if len(pw) < 10:
-            st.warning("Use at least 10 characters.")
-        else:
-            st.code(hash_password(pw), language="text")
-
-
-def login_screen() -> None:
+# By default the app opens directly. To lock it, add ONE line in Streamlit Cloud ->
+# App settings -> Secrets:   APP_PASSWORD = "your password"   (no hashing, no terminal).
+# You can also make the app private in Streamlit Cloud (Share -> only specific people).
+def login_screen(expected: str) -> None:
     _, mid, _ = st.columns([1, 1.3, 1])
     with mid:
         st.markdown(f"<div class='hero' style='text-align:center'><h1>{APP_NAME}</h1><p>{TAGLINE}</p></div>", unsafe_allow_html=True)
@@ -2043,16 +1963,13 @@ def login_screen() -> None:
             st.error(f"Too many failed attempts. Try again in {int(lock - time.time())} seconds.")
             return
         with st.form("login"):
-            user = st.text_input("Username")
             pw = st.text_input("Password", type="password")
-            ok = st.form_submit_button("Sign in", type="primary")
+            ok = st.form_submit_button("Open", type="primary")
         if ok:
-            exp_user = str(get_secret("OWNER_USERNAME", "owner"))
-            good = hmac.compare_digest(user.encode(), exp_user.encode()) and verify_password(pw, str(get_secret("OWNER_PASSWORD_HASH")))
-            if good:
+            if hmac.compare_digest(pw.encode(), expected.encode()):
                 st.session_state["authed"] = True
                 st.session_state["fails"] = 0
-                st.query_params["s"] = make_session_token(exp_user)
+                st.query_params["s"] = make_session_token("owner")
                 st.rerun()
             else:
                 st.session_state["fails"] = st.session_state.get("fails", 0) + 1
@@ -2060,24 +1977,24 @@ def login_screen() -> None:
                 if st.session_state["fails"] >= 5:
                     st.session_state["lock_until"] = time.time() + 120
                     st.session_state["fails"] = 0
-                st.error("Incorrect username or password.")
+                st.error("Incorrect password.")
+
+
+def password_enabled() -> bool:
+    return bool(get_secret("APP_PASSWORD"))
 
 
 def auth_gate() -> bool:
     if st.session_state.get("authed"):
         return True
-    if not get_secret("OWNER_PASSWORD_HASH"):
-        if str(get_secret("AS22122_ALLOW_NO_AUTH", "0")) == "1":
-            st.session_state["authed"] = True
-            st.session_state["no_auth"] = True
-            return True
-        setup_screen()
-        return False
+    if not password_enabled():
+        st.session_state["authed"] = True      # open access (default)
+        return True
     tok = st.query_params.get("s")
-    if tok and check_session_token(str(tok), str(get_secret("OWNER_USERNAME", "owner"))):
+    if tok and check_session_token(str(tok), "owner"):
         st.session_state["authed"] = True
         return True
-    login_screen()
+    login_screen(str(get_secret("APP_PASSWORD")))
     return False
 
 
@@ -2116,11 +2033,11 @@ def render_sidebar() -> None:
             st.button(shown, icon=icon, key=f"nav_{label}", type="primary" if cur == label else "secondary",
                       on_click=go, args=(label,))
         st.divider()
-        if DB is not None and DB.backend == "sqlite":
-            st.warning("LOCAL DEVELOPMENT MODE: data is stored in a local file and may be lost on Streamlit Cloud restarts.")
-        if st.session_state.get("no_auth"):
-            st.error("Authentication is DISABLED (development only).")
-        st.button("Sign out", icon=":material/logout:", on_click=logout, key="signout")
+        st.warning("Data is stored in local JSON files. Streamlit Cloud may erase them on restart or redeploy - download a backup in Settings & Backup.")
+        if not password_enabled():
+            st.caption("Open access: anyone with the link can use this app. See Settings & Backup to lock it.")
+        if password_enabled():
+            st.button("Sign out", icon=":material/logout:", on_click=logout, key="signout")
 
 
 # =============================================================================
@@ -2156,6 +2073,8 @@ def page_dashboard() -> None:
     c2.button("Start New Test", type="primary", icon=":material/play_arrow:", on_click=go, args=("Start a Test",), key="dash_start")
 
     chdf, att, ans, mk = cached_chapters(), cached_attempts(), cached_answers(), cached_mistakes()
+    if not cached_questions().empty:
+        st.caption("Tip: your data lives in local files that Streamlit Cloud may erase on restart - download a backup from Settings & Backup.")
     if chdf.empty:
         st.info("No chapters yet. Load the starter list (from the units you supplied) or add your own - then check them against the official CBSE syllabus for your session.")
         if st.button("Load starter chapters", key="seed_dash"):
@@ -3444,32 +3363,44 @@ def page_analytics() -> None:
 def page_settings() -> None:
     page_title("Settings & Backup")
     ok, msg = DB.check()
-    (st.success if ok else st.error)(("Database OK - " if ok else "Database problem - ") + msg)
-    if DB.backend == "sqlite":
-        st.warning("You are in LOCAL DEVELOPMENT MODE. On Streamlit Community Cloud local files are not guaranteed to survive restarts or redeploys. "
-                   "Configure Supabase (see README) for permanent storage, and download backups below regularly.")
+    st.success(msg)
+    st.warning("**Please read:** your data lives in local JSON files on the Streamlit server. Streamlit Community Cloud does NOT guarantee "
+               "that local files persist - they can be erased when the app restarts, sleeps for a long time, or is redeployed (e.g. after you push to GitHub). "
+               "Download a backup after every study session that matters.")
+    st.markdown("#### Backup (recommended habit)")
+    st.download_button("Download full backup (JSON, includes images)", build_backup(DB, OWNER),
+                       file_name=f"as22122_backup_{datetime.now(IST).strftime('%Y-%m-%d')}.json", mime="application/json", key="bk_full", type="primary")
+    st.caption(f"To make your data survive redeploys: rename the downloaded file to **{BACKUP_FILENAME}** and upload it to your GitHub repository next to app.py "
+               "(use a PRIVATE repository - it contains your question bank and results). When the app starts with no data, it loads that file automatically.")
+    st.markdown("#### Restore from a backup")
+    up = st.file_uploader("Upload an as22122 backup (JSON)", type=["json"], key="restore_file")
+    if up is not None:
+        if st.checkbox("I understand this REPLACES everything currently in the app with the backup contents", key="restore_ack"):
+            if st.button("Restore now", type="primary", key="restore_go"):
+                try:
+                    counts = restore_into_store(DB, up.getvalue(), OWNER)
+                    invalidate_cache()
+                    st.success("Restored: " + ", ".join(f"{k} {v}" for k, v in counts.items()))
+                except (ValueError, StoreError) as e:
+                    st.error(str(e))
+    st.markdown("#### Export tables (CSV)")
+    tables = {"questions": load_questions_df, "chapters": load_chapters_df, "attempts": load_attempts_df, "attempt_answers": load_answers_df, "mistakes": load_mistakes_df}
+    cols = st.columns(len(tables))
+    for c, (name, fn) in zip(cols, tables.items()):
+        df = fn()
+        c.download_button(f"{name} ({len(df)})", df_to_csv(df), file_name=f"as22122_{name}.csv", mime="text/csv", key=f"bk_{name}")
     st.markdown("#### Hindi course")
     cur = get_setting("hindi_course", "")
     hc = st.text_input("Course label shown next to Hindi (e.g. Course A / Course B)", value=cur, key="set_hindi")
     if st.button("Save course label", key="set_hindi_save"):
         set_setting("hindi_course", hc.strip())
         st.rerun()
-    st.markdown("#### Backups (CSV)")
-    tables = {"questions": load_questions_df, "chapters": load_chapters_df, "attempts": load_attempts_df, "attempt_answers": load_answers_df, "mistakes": load_mistakes_df}
-    cols = st.columns(len(tables))
-    for c, (name, fn) in zip(cols, tables.items()):
-        df = fn()
-        c.download_button(f"{name} ({len(df)})", df_to_csv(df), file_name=f"as22122_{name}.csv", mime="text/csv", key=f"bk_{name}")
-    st.markdown("#### Full backup including images (JSON)")
-    if st.button("Prepare full backup", key="bk_prepare"):
-        data = {t: q_select(t) for t in SCHEMA if t != "attempts"}
-        data["attempts"] = q_select("attempts")
-        st.session_state["full_backup"] = json.dumps(data, ensure_ascii=False)
-    if st.session_state.get("full_backup"):
-        st.download_button("Download full backup", st.session_state["full_backup"], file_name="as22122_full_backup.json", mime="application/json", key="bk_full")
-    st.markdown("#### Built-in tests")
-    st.code("python app.py --selftest", language="bash")
-    st.caption("Run this in a terminal (with the same requirements installed) to test scoring, validation, import, timer deadline storage, mistake tracking and database operations against a throw-away database.")
+    st.markdown("#### Who can open this app?")
+    if password_enabled():
+        st.success("A password is set (APP_PASSWORD secret).")
+    else:
+        st.info("Open access: anyone who has the link can use and change this app's data. Two easy ways to lock it, both inside Streamlit Cloud (no code, no terminal): "
+                "(1) App settings -> Sharing -> make it private / invite only your email; or (2) App settings -> Secrets -> add the line `APP_PASSWORD = \"your password\"` and reboot the app.")
 
 
 # =============================================================================
@@ -3507,12 +3438,12 @@ def main() -> None:
         render_sidebar()
         PAGES.get(st.session_state.get("page", "Dashboard"), page_dashboard)()
     except StoreError as e:
-        st.error(f"Database problem: {e}")
-        st.caption("Check SUPABASE_URL / SUPABASE_KEY in your secrets and that schema.sql was run. Your data is not lost.")
+        st.error(f"Storage problem: {e}")
+        st.caption("The app could not read or write its data folder. Try rebooting the app; you can restore from a backup in Settings & Backup.")
 
 
 # =============================================================================
-# SECTION 31 - COMMAND-LINE HELPERS & ENTRY POINT
+# SECTION 31 - OPTIONAL SELF-TEST & ENTRY POINT
 # =============================================================================
 def _cli() -> bool:
     if "--selftest" in sys.argv:
@@ -3522,17 +3453,6 @@ def _cli() -> bool:
         bad = [r for r in res if not r[1]]
         print(f"\n{len(res) - len(bad)}/{len(res)} tests passed")
         sys.exit(1 if bad else 0)
-    if "--print-schema" in sys.argv:
-        print(schema_sql())
-        return True
-    if "--hash-password" in sys.argv:
-        import getpass
-        pw = getpass.getpass("Choose a password (min 10 chars): ")
-        if len(pw) < 10 or pw != getpass.getpass("Repeat: "):
-            print("Passwords differ or are too short.")
-            sys.exit(1)
-        print("\nOWNER_PASSWORD_HASH = \"" + hash_password(pw) + "\"")
-        return True
     return False
 
 
